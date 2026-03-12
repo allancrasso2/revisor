@@ -8,12 +8,14 @@
 # - Heurísticas de títulos por tema e referências ABNT-like
 # - IA opcional com prompt estruturado
 # - Confiabilidade: self-test de API, timeout maior, retry com backoff e fallback p/ Chat
+# - (modificado) Interface na sidebar para inserir/salvar/ou remover OPENAI_API_KEY
 
 import os
 import re
 import io
 import json
 import time
+import datetime
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
@@ -21,8 +23,12 @@ from typing import Dict, List, Optional, Tuple
 import streamlit as st
 import pandas as pd
 
-# Parsing
-from docx import Document as DocxDocument
+# Parsing: python-docx import tolerante (evita crash no deploy se não instalado)
+try:
+    from docx import Document as DocxDocument
+except Exception:
+    DocxDocument = None
+
 import pdfplumber
 from pypdf import PdfReader
 
@@ -36,16 +42,95 @@ try:
 except Exception:
     pass
 
+# ------------------ Helpers para salvar/ler a chave localmente ------------------
+def _write_env_file(key: str, path: str = ".env") -> None:
+    """
+    Escreve ou atualiza OPENAI_API_KEY no arquivo .env (local).
+    Substitui a linha existente se houver.
+    """
+    try:
+        p = Path(path)
+        lines = []
+        if p.exists():
+            lines = p.read_text(encoding="utf-8").splitlines()
+        found = False
+        new_lines = []
+        for ln in lines:
+            if ln.strip().startswith("OPENAI_API_KEY"):
+                # manter entre aspas para compatibilidade
+                new_lines.append(f'OPENAI_API_KEY="{key}"')
+                found = True
+            else:
+                new_lines.append(ln)
+        if not found:
+            new_lines.append(f'OPENAI_API_KEY="{key}"')
+        p.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    except Exception:
+        raise
 
+def _remove_env_key(path: str = ".env") -> None:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return
+        lines = p.read_text(encoding="utf-8").splitlines()
+        new_lines = [ln for ln in lines if not ln.strip().startswith("OPENAI_API_KEY")]
+        p.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+    except Exception:
+        pass
+
+def _write_streamlit_secrets(key: str, dirpath: str = ".streamlit") -> None:
+    """
+    Cria/atualiza .streamlit/secrets.toml com OPENAI_API_KEY.
+    AVISO: não comitar esse arquivo no seu repo.
+    """
+    try:
+        pdir = Path(dirpath)
+        pdir.mkdir(parents=True, exist_ok=True)
+        secrets_path = pdir / "secrets.toml"
+        # conteúdo simples: abrir e sobrescrever (avisa usuário a não commitar)
+        secrets_path.write_text(f'OPENAI_API_KEY = "{key}"\n', encoding="utf-8")
+    except Exception:
+        raise
+
+def _remove_streamlit_secrets(dirpath: str = ".streamlit") -> None:
+    try:
+        p = Path(dirpath) / "secrets.toml"
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+# ------------------ Carregamento da chave (única definição consolidada) ------------------
 def load_api_key() -> Optional[str]:
+    """
+    Procura a chave na ordem:
+     1) st.session_state (se foi inserida na sessão)
+     2) variáveis de ambiente (os.environ)
+     3) st.secrets (caso esteja no ambiente de deploy)
+    """
+    # 1) session_state
+    try:
+        if "OPENAI_API_KEY" in st.session_state and st.session_state["OPENAI_API_KEY"]:
+            return st.session_state["OPENAI_API_KEY"]
+    except Exception:
+        # st.session_state não disponível no ambiente de import (edge), seguir
+        pass
+
+    # 2) environment
     key = os.getenv("OPENAI_API_KEY")
     if key:
         return key
-    try:
-        return st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        return None
 
+    # 3) st.secrets (Streamlit Cloud)
+    try:
+        key = st.secrets.get("OPENAI_API_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+
+    return None
 
 # IA opcional
 try:
@@ -53,21 +138,75 @@ try:
 except Exception:
     OpenAI = None
 
-
 # ===================== Config =====================
 st.set_page_config(page_title="Revisão de Conteúdos (Autor)", layout="wide")
 st.title(" 🕵️‍♂️ Revisão de Arquivos - Aula texto")
 
-# ===================== Helpers =====================
-def load_api_key() -> Optional[str]:
-    key = os.getenv("OPENAI_API_KEY")
-    if key:
-        return key
-    try:
-        return st.secrets["OPENAI_API_KEY"]  # não explode se não existir
-    except Exception:
-        return None
+# ===================== Sidebar: Configurações + API Key UI =====================
+st.sidebar.header("Configurações")
 
+# --- Seção para inserir/gerir OpenAI API Key ---
+with st.sidebar.expander("🔑 OpenAI API Key (opcional)", expanded=True):
+    st.write(
+        "Cole sua chave da OpenAI (começa com `sk-...`). "
+        "Se você estiver usando Streamlit Cloud, é recomendado adicionar a chave em *App settings → Secrets*."
+    )
+    entered_key = st.text_input("Chave OPENAI (oculta)", value="", type="password", key="__openai_input")
+    col1, col2 = st.columns(2)
+    save_env = col1.checkbox("Salvar em .env (local)", value=False, key="__save_env")
+    save_secrets_toml = col2.checkbox("Criar .streamlit/secrets.toml", value=False, key="__save_st_secrets")
+
+    if st.button("Salvar chave na sessão", key="__save_session"):
+        if not entered_key:
+            st.warning("Cole a chave antes de salvar.")
+        else:
+            # salvar na sessão e em os.environ para uso imediato
+            st.session_state["OPENAI_API_KEY"] = entered_key
+            os.environ["OPENAI_API_KEY"] = entered_key
+            saved_msgs = []
+            # tentativa de salvar em .env
+            if save_env:
+                try:
+                    _write_env_file(entered_key, path=".env")
+                    saved_msgs.append("Salva em `.env` (não comite este arquivo).")
+                except Exception as e:
+                    st.error(f"Falha ao salvar .env: {e}")
+            # tentativa de salvar em .streamlit/secrets.toml
+            if save_secrets_toml:
+                try:
+                    _write_streamlit_secrets(entered_key, dirpath=".streamlit")
+                    saved_msgs.append("Criado `.streamlit/secrets.toml` (não comite).")
+                except Exception as e:
+                    st.error(f"Falha ao criar .streamlit/secrets.toml: {e}")
+            if not (save_env or save_secrets_toml):
+                saved_msgs.append("Chave apenas salva na sessão atual (será perdida ao reiniciar o app).")
+            st.success("Chave configurada. " + " ".join(saved_msgs))
+
+    if st.button("Remover chave salva (session + .env + secrets.toml)", key="__remove_key"):
+        # remove da sessão e env e arquivos
+        st.session_state.pop("OPENAI_API_KEY", None)
+        try:
+            os.environ.pop("OPENAI_API_KEY", None)
+        except Exception:
+            pass
+        try:
+            _remove_env_key(".env")
+        except Exception:
+            pass
+        try:
+            _remove_streamlit_secrets(".streamlit")
+        except Exception:
+            pass
+        st.info("Chave removida da sessão e arquivos locais (se existentes). Se estiver no Streamlit Cloud, remova via App → Secrets.")
+
+    # mostrar chave atual detectada (mas não exibir o valor)
+    current = load_api_key()
+    if current:
+        st.write("🔒 Chave detectada e ativa nesta sessão.")
+    else:
+        st.write("⚪ Nenhuma chave detectada. A IA ficará desativada até inserir a chave.")
+
+# ===================== Helpers =====================
 def quick_api_selftest() -> Tuple[bool, str]:
     key = load_api_key()
     if not key or OpenAI is None:
@@ -188,6 +327,8 @@ def split_sections(text: str) -> Dict[str, str]:
 
 # ===================== Parsing =====================
 def extract_text_from_docx(f: io.BytesIO) -> str:
+    if DocxDocument is None:
+        raise RuntimeError("python-docx não está disponível. Adicione 'python-docx' em requirements.txt")
     doc = DocxDocument(f)
     texts = [p.text for p in doc.paragraphs]
     return sanitize_text("\n".join(texts))
@@ -357,7 +498,7 @@ def call_ia_sections(tema: str, assuntos: List[str], wpp: int, secs: Dict[str, s
     # 1) tenta Responses com retry
     try:
         resp = _responses_call_with_retry(client, prompt)
-        text = resp.output_text
+        text = getattr(resp, "output_text", None) or str(resp)
     except Exception as e1:
         # 2) fallback: Chat Completions
         try:
@@ -383,10 +524,6 @@ def call_ia_sections(tema: str, assuntos: List[str], wpp: int, secs: Dict[str, s
         return None
 
 # ===================== Inserção (não-invasiva) dos PROMPTS FIXOS + helper JSON =====================
-# Este bloco adiciona prompts fixos e a função call_fixed_prompt sem alterar
-# as funcionalidades existentes. Use onde preferir no fluxo UI para checagens
-# específicas solicitadas pelo usuário.
-
 # Extrator robusto de JSON em string (pega o bloco JSON mais provável)
 def extract_json_from_text(text: str) -> Optional[dict]:
     """
@@ -664,7 +801,7 @@ def eval_metrics(sections: Dict[str, str], tema: str, wpp: int, min_refs: int,
     return out, ia_json
 
 # ===================== UI =====================
-st.sidebar.header("Configurações")
+# sidebar inputs (tema/assuntos/wpp/min_refs) - mantive como antes, após a seção API Key
 tema = st.sidebar.text_input("Tema da Aula (para checagem de títulos)", value="")
 assuntos_raw = st.sidebar.text_input("Assuntos granulares (separe por ; )", value="")
 assuntos = [s.strip() for s in assuntos_raw.split(";") if s.strip()]
@@ -768,7 +905,11 @@ if uploaded:
         # extrai texto
         try:
             if up.name.lower().endswith(".docx"):
-                fulltext = extract_text_from_docx(bio)
+                try:
+                    fulltext = extract_text_from_docx(bio)
+                except RuntimeError as rexc:
+                    st.error(str(rexc))
+                    continue
             else:
                 fulltext = extract_text_from_pdf(bio)
         except Exception as e:
